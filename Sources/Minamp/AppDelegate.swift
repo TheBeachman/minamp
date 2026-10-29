@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = Self.editMenu()
+        player.api = api
         let strip = Self.startFrame()
         // Two windows, each with its own shadow: the strip, and the library card
         // that appears beside it. The strip window never resizes to make room.

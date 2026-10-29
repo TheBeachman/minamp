@@ -112,13 +112,27 @@ final class SpotifyPlayer: ObservableObject {
         run("set sound volume to \(Int(v))", refreshAfter: false)
     }
 
+    /// Set by AppDelegate. When signed in with playback permission, songs and
+    /// playlists start through Spotify Connect, which never touches Spotify's
+    /// window. AppleScript "play track" makes Spotify open and front its window.
+    weak var api: SpotifyAPI?
+
     /// Play a playlist, album or track URI on its own.
     func play(_ uri: String) {
-        run("play track \"\(Self.clean(uri))\"")
+        if let api, api.canControl {
+            connectPlay { try await api.play(context: uri, track: nil, fallback: []) }
+        } else {
+            run("play track \"\(Self.clean(uri))\"")
+        }
     }
 
     /// Play a track inside a playlist/album/library context, so the queue continues from there.
-    func play(track uri: String, in context: String?) {
+    /// `fallback` is the list it was picked from, used if Spotify won't take the context.
+    func play(track uri: String, in context: String?, fallback: [String] = []) {
+        if let api, api.canControl {
+            connectPlay { try await api.play(context: context, track: uri, fallback: fallback) }
+            return
+        }
         let t = Self.clean(uri)
         if let context, !context.isEmpty,
            run("play track \"\(t)\" in context \"\(Self.clean(context))\"") {
@@ -127,22 +141,36 @@ final class SpotifyPlayer: ObservableObject {
         run("play track \"\(t)\"")
     }
 
+    private func connectPlay(_ request: @escaping () async throws -> Void) {
+        Task {
+            guard await ensureRunning() else { return }
+            do {
+                try await request()
+                lastError = nil
+            } catch {
+                lastError = error.localizedDescription
+            }
+            try? await Task.sleep(for: .milliseconds(400))
+            refresh()
+        }
+    }
+
     @discardableResult
     private func run(_ command: String, refreshAfter: Bool = true) -> Bool {
         // Talking to Spotify while it's quit would launch it with its window up.
         guard Self.spotifyIsRunning else {
-            launchHidden(then: command)
+            Task {
+                if await ensureRunning() { run(command, refreshAfter: refreshAfter) }
+            }
             return true
         }
         guard let script = NSAppleScript(source: "tell application \"Spotify\" to \(command)") else { return false }
-        let before = Snapshot.take()
         var error: NSDictionary?
         script.executeAndReturnError(&error)
         if let error {
             lastError = error[NSAppleScript.errorMessage] as? String
             return false
         }
-        before?.restore()
         if refreshAfter {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 MainActor.assumeIsolated { self?.refresh() }
@@ -153,87 +181,42 @@ final class SpotifyPlayer: ObservableObject {
 
     // MARK: Starting Spotify in the background
 
-    private var queued: [String] = []
-    private var launching = false
+    private var launch: Task<Bool, Never>?
 
-    /// Start Spotify hidden, then send the queued commands once it answers.
-    private func launchHidden(then command: String) {
-        queued.append(command)
-        guard !launching else { return }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleID) else {
-            queued = []
-            lastError = "Spotify isn't installed."
-            return
+    /// Start Spotify hidden if it's quit, and wait until it answers. True once it's ready.
+    func ensureRunning() async -> Bool {
+        if Self.spotifyIsRunning && launch == nil { return true }
+        if launch == nil {
+            launch = Task { await launchHidden() }
         }
-        launching = true
+        let ok = await launch!.value
+        launch = nil
+        return ok
+    }
+
+    private func launchHidden() async -> Bool {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleID) else {
+            lastError = "Spotify isn't installed."
+            return false
+        }
         let config = NSWorkspace.OpenConfiguration()
         config.activates = false
         config.hides = true
         config.addsToRecentItems = false
-        NSWorkspace.shared.openApplication(at: url, configuration: config) { [weak self] app, _ in
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.waitUntilReady(app, attempt: 0) }
-            }
+        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: config)
+        for _ in 0..<40 {
+            var error: NSDictionary?
+            NSAppleScript(source: """
+                tell application "Spotify"
+                    with timeout of 2 seconds
+                        get player state
+                    end timeout
+                end tell
+                """)?.executeAndReturnError(&error)
+            if error == nil { return true }
+            try? await Task.sleep(for: .milliseconds(250))
         }
-    }
-
-    private func waitUntilReady(_ app: NSRunningApplication?, attempt: Int) {
-        app?.hide()
-        var error: NSDictionary?
-        NSAppleScript(source: """
-            tell application "Spotify"
-                with timeout of 2 seconds
-                    get player state
-                end timeout
-            end tell
-            """)?.executeAndReturnError(&error)
-        if error != nil && attempt < 40 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                MainActor.assumeIsolated { self?.waitUntilReady(app, attempt: attempt + 1) }
-            }
-            return
-        }
-        launching = false
-        let commands = queued
-        queued = []
-        for c in commands { run(c) }
-    }
-
-    /// Spotify opens and fronts its window whenever it's told to play, even when
-    /// its window was closed, minimized or hidden. Remember how things were before
-    /// a command and put them back for a couple of seconds afterwards.
-    private struct Snapshot {
-        let spotifyWasShowing: Bool
-        let frontmost: NSRunningApplication?
-
-        static func take() -> Snapshot? {
-            guard let sp = spotify else { return nil }
-            return Snapshot(spotifyWasShowing: !sp.isHidden && windowsOnScreen(sp) > 0,
-                            frontmost: NSWorkspace.shared.frontmostApplication)
-        }
-
-        func restore(attempt: Int = 0) {
-            guard !spotifyWasShowing, let sp = Self.spotify else { return }
-            // Hand focus back first: macOS won't hide the app that's in front.
-            if sp.isActive, let prev = frontmost, prev.bundleIdentifier != SpotifyPlayer.bundleID {
-                prev.activate()
-            }
-            if !sp.isHidden && Self.windowsOnScreen(sp) > 0 { sp.hide() }
-            guard attempt < 20 else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { restore(attempt: attempt + 1) }
-        }
-
-        static var spotify: NSRunningApplication? {
-            NSRunningApplication.runningApplications(withBundleIdentifier: SpotifyPlayer.bundleID).first
-        }
-
-        static func windowsOnScreen(_ app: NSRunningApplication) -> Int {
-            let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
-            return list.filter {
-                ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
-                    && ($0[kCGWindowLayer as String] as? Int) == 0
-            }.count
-        }
+        return false
     }
 
     /// URIs come from the Web API; strip anything that could break out of the AppleScript string.

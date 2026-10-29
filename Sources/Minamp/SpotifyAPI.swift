@@ -43,7 +43,7 @@ enum APIError: LocalizedError {
 final class SpotifyAPI: ObservableObject {
     static let port: UInt16 = 8973
     static let redirectURI = "http://127.0.0.1:8973/callback"
-    static let scopes = "playlist-read-private playlist-read-collaborative user-library-read user-read-currently-playing"
+    static let scopes = "playlist-read-private playlist-read-collaborative user-library-read user-read-currently-playing user-read-playback-state user-modify-playback-state"
 
     @Published var clientID: String {
         didSet { UserDefaults.standard.set(clientID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "clientID") }
@@ -58,6 +58,10 @@ final class SpotifyAPI: ObservableObject {
     @Published private(set) var playingContext: LibraryItem?
     /// False until the sign-in includes the now-playing permission (added after first release).
     @Published private(set) var canSeeContext = false
+    /// True once the sign-in can start playback through Spotify Connect.
+    @Published private(set) var canControl = false
+    /// The sign-in predates permissions Minamp now asks for.
+    var needsReconnect: Bool { connected && !(canSeeContext && canControl) }
     @Published var message: String?
 
     private var accessToken: String?
@@ -67,7 +71,7 @@ final class SpotifyAPI: ObservableObject {
 
     init() {
         clientID = UserDefaults.standard.string(forKey: "clientID") ?? ""
-        canSeeContext = Self.grantedScopes.contains("user-read-currently-playing")
+        applyScopes(Self.grantedScopes)
         if let cached = try? JSONDecoder().decode([LibraryItem].self, from: Data(contentsOf: AppSupport.url("playlists.json"))) {
             playlists = cached  // instant list at launch; refreshed from Spotify below
         }
@@ -142,7 +146,8 @@ final class SpotifyAPI: ObservableObject {
         playlists = []
         liked = nil
         playingContext = nil
-        canSeeContext = false
+        applyScopes("")
+        deviceID = nil
         UserDefaults.standard.removeObject(forKey: "grantedScopes")
         try? FileManager.default.removeItem(at: AppSupport.url("playlists.json"))
     }
@@ -173,7 +178,7 @@ final class SpotifyAPI: ObservableObject {
         if let refresh = json["refresh_token"] as? String { TokenStore.save(refresh) }
         if let scope = json["scope"] as? String {
             UserDefaults.standard.set(scope, forKey: "grantedScopes")
-            canSeeContext = scope.contains("user-read-currently-playing")
+            applyScopes(scope)
         }
     }
 
@@ -324,6 +329,73 @@ final class SpotifyAPI: ObservableObject {
             }
         } catch {
             // Not worth surfacing; the label just stays as it was.
+        }
+    }
+
+    private func applyScopes(_ scope: String) {
+        canSeeContext = scope.contains("user-read-currently-playing")
+        canControl = scope.contains("user-modify-playback-state") && scope.contains("user-read-playback-state")
+    }
+
+    // MARK: Playback (Spotify Connect)
+
+    private var deviceID: String?
+
+    /// Start playback on this Mac's Spotify app. Plays `track` inside `context`
+    /// when both are given; if Spotify rejects the context (Liked Songs can be
+    /// picky), plays `fallback` as a plain list instead.
+    func play(context: String?, track: String?, fallback: [String]) async throws {
+        let device = try await thisMac()
+        var body: [String: Any] = [:]
+        if let context, !context.isEmpty {
+            body["context_uri"] = context
+            if let track { body["offset"] = ["uri": track] }
+        } else if let track {
+            body["uris"] = [track]
+        }
+        do {
+            try await send("PUT", "/me/player/play?device_id=\(device)", body: body)
+        } catch APIError.http(let code, _) where (code == 400 || code == 403) && !fallback.isEmpty {
+            try await send("PUT", "/me/player/play?device_id=\(device)", body: ["uris": Array(fallback.prefix(200))])
+        } catch APIError.http(404, _) {
+            // The device id went stale (Spotify restarted): look it up again once.
+            deviceID = nil
+            try await send("PUT", "/me/player/play?device_id=\(try await thisMac())", body: body)
+        }
+    }
+
+    /// The Spotify Connect device for the Spotify app on this Mac. A freshly
+    /// launched Spotify takes a few seconds to register, so keep asking briefly.
+    private func thisMac() async throws -> String {
+        if let deviceID { return deviceID }
+        let macName = Host.current().localizedName ?? ""
+        for _ in 0..<16 {
+            let devices = try await get("/me/player/devices")["devices"] as? [[String: Any]] ?? []
+            let computers = devices.filter { ($0["type"] as? String)?.lowercased() == "computer" }
+            let pick = computers.first { ($0["name"] as? String) == macName }
+                ?? computers.first { $0["is_active"] as? Bool == true }
+                ?? computers.first
+            if let id = pick?["id"] as? String {
+                deviceID = id
+                return id
+            }
+            try await Task.sleep(for: .milliseconds(500))
+        }
+        throw APIError.message("Spotify on this Mac didn't show up in Spotify Connect.")
+    }
+
+    private func send(_ method: String, _ path: String, body: [String: Any]) async throws {
+        var req = URLRequest(url: URL(string: "https://api.spotify.com/v1" + path)!)
+        req.httpMethod = method
+        req.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let msg = (json?["error"] as? [String: Any])?["message"] as? String ?? "request failed"
+            throw APIError.http(code, msg)
         }
     }
 

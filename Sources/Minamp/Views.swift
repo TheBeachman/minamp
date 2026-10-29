@@ -343,15 +343,15 @@ struct TransportBar: View {
                     }
                     .font(.system(size: 11))
                     .padding(.leading, 4)
-                } else if api.connected && !api.canSeeContext {
-                    // The sign-in predates the now-playing permission: ask right where the name will go.
-                    Button(api.connecting ? "Approve in your browser…" : "Reconnect to show playlist") { api.connect() }
+                } else if api.needsReconnect {
+                    // The sign-in predates permissions Minamp now uses: ask right where the name will go.
+                    Button(api.connecting ? "Approve in your browser…" : "Reconnect Spotify") { api.connect() }
                         .buttonStyle(.plain)
                         .font(.system(size: 11))
                         .foregroundStyle(accent)
                         .disabled(api.connecting)
                         .padding(.leading, 4)
-                        .help("Spotify needs one more permission to say which playlist is playing")
+                        .help("Spotify needs new permissions: to show what's playing, and to play songs without opening its window")
                 }
                 Spacer(minLength: 4)
                 Image(systemName: vol < 1 ? "speaker.slash.fill" : "speaker.wave.2.fill")
@@ -702,7 +702,10 @@ struct TrackList: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(tracks) { t in
-                        TrackRow(track: t, playing: t.uri == player.trackURI) { player.play(track: t.uri, in: context) }
+                        TrackRow(track: t, playing: t.uri == player.trackURI) {
+                            let rest = tracks.drop { $0.id != t.id }.map(\.uri)
+                            player.play(track: t.uri, in: context, fallback: rest)
+                        }
                     }
                 }
                 .padding(.vertical, 4)
