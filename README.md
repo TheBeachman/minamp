@@ -10,6 +10,7 @@ A tiny always-on-top Spotify controller for macOS. Shrink it to any size; rest t
 - Click the strip to expand it right away.
 - **Folders:** Spotify doesn't share its playlist folders with outside apps, so Minamp keeps its own (`~/Library/Application Support/Minamp/folders.json`). Right-click a playlist → Move to Folder; right-click a folder to rename or delete it.
 - The playlist or album that's playing shows next to the artist and in the library's bottom row; click it to open it.
+- **Menu bar icon** (three bars): Show/Hide Minamp, Keep Expanded, Open Spotify, Open at Login, Quit. Opening the app again from Spotlight also brings it back.
 - Right-click for Keep Expanded, Open at Login, Disconnect and Quit.
 
 ## Build

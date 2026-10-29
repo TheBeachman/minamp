@@ -31,6 +31,7 @@ final class PanelController {
     private var pressStrip: NSRect?
     private var waitForExit = false
     private var animating = false
+    private(set) var isHidden = false
     private var moveStart: (mouse: NSPoint, origin: NSPoint)?
     private var resizeStart: (mouse: NSPoint, strip: NSRect, library: NSSize)?
 
@@ -58,6 +59,7 @@ final class PanelController {
     }
 
     private func tick() {
+        guard !isHidden else { return }
         let mouse = NSEvent.mouseLocation
         let inside = hotRects.contains { $0.insetBy(dx: -1, dy: -1).contains(mouse) }
         if ui.hovering != inside { ui.hovering = inside }
@@ -127,6 +129,24 @@ final class PanelController {
                 self.animating = false
             }
         })
+    }
+
+    /// Hide or show the whole player (from the menu bar icon).
+    func setHidden(_ hide: Bool) {
+        guard hide != isHidden else { return }
+        isHidden = hide
+        if hide {
+            if ui.expanded {
+                stripPanel.removeChildWindow(libraryPanel)
+                libraryPanel.orderOut(nil)
+                ui.expanded = false
+            }
+            ui.hovering = false
+            stripPanel.orderOut(nil)
+        } else {
+            insideSince = nil
+            stripPanel.orderFrontRegardless()
+        }
     }
 
     /// Give the library keyboard focus (e.g. to type a folder name).

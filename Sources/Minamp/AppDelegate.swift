@@ -18,6 +18,7 @@ final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: PanelController!
+    private var statusMenu: StatusMenu!
     let player = SpotifyPlayer()
     let api = SpotifyAPI()
     let ui = UIState()
@@ -33,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let libraryPanel = makePanel(frame: strip, root: LibraryCard())
         controller = PanelController(strip: stripPanel, library: libraryPanel, ui: ui, frame: strip)
         stripPanel.orderFrontRegardless()
+        statusMenu = StatusMenu(controller: controller, ui: ui)
 
         // When the song changes, ask Spotify what it's playing from.
         player.$trackURI
@@ -46,6 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ui.pinned = true
             controller.expand()
         }
+    }
+
+    /// Opening Minamp again (Spotlight, Finder) while it's running brings the strip back.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        controller.setHidden(false)
+        return false
     }
 
     private func makePanel<V: View>(frame: NSRect, root: V) -> PlayerPanel {

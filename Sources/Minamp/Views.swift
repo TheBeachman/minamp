@@ -60,6 +60,7 @@ struct AppMenu: View {
             set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
         ))
         Divider()
+        Button("Hide Minamp") { ui.controller?.setHidden(true) }
         Button("Quit Minamp") { NSApp.terminate(nil) }
     }
 }
