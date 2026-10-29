@@ -88,6 +88,8 @@ final class SpotifyAPI: ObservableObject {
             .init(name: "code_challenge", value: challenge),
             .init(name: "state", value: state),
             .init(name: "scope", value: Self.scopes),
+            // Always show the consent page, with its "Not you?" link, so the account is visible.
+            .init(name: "show_dialog", value: "true"),
         ]
 
         authServer?.stop()
@@ -123,7 +125,9 @@ final class SpotifyAPI: ObservableObject {
         }
     }
 
-    func disconnect() {
+    /// Forget the sign-in. `forgetClientID` also clears the developer app, to start setup over.
+    func disconnect(forgetClientID: Bool = false) {
+        if forgetClientID { clientID = "" }
         Keychain.delete()
         accessToken = nil
         connected = false

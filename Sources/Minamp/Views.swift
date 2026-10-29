@@ -44,6 +44,9 @@ struct RootView: View {
                 Button("Reload Playlists") { Task { await api.loadPlaylists() } }
                 Button("Disconnect Spotify Account") { api.disconnect() }
             }
+            if api.connected || !api.clientID.isEmpty {
+                Button("Reset Spotify Setup…") { api.disconnect(forgetClientID: true) }
+            }
             Toggle("Open at Login", isOn: Binding(
                 get: { SMAppService.mainApp.status == .enabled },
                 set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
