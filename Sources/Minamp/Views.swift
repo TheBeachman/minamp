@@ -595,9 +595,17 @@ struct ConnectView: View {
                 }
                 step(3) {
                     Text("Paste the app's Client ID:")
-                    TextField("Client ID", text: $api.clientID)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11, design: .monospaced))
+                    HStack {
+                        TextField("Client ID", text: $api.clientID)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11, design: .monospaced))
+                        Button("Paste") {
+                            if let s = NSPasteboard.general.string(forType: .string) {
+                                api.clientID = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                        }
+                        .controlSize(.mini)
+                    }
                 }
                 Button(api.connecting ? "Waiting for browser…" : "Connect") { api.connect() }
                     .controlSize(.small)
