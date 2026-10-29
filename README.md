@@ -96,7 +96,12 @@ Your playlists appear. You're done.
   `~/Library/Application Support/Minamp`, in a folder only your user account can open.
 - **Wrong account, or starting over:** right-click the strip → **Reset Spotify Setup…**
 - **Updating:** quit Minamp, then run the install command from step 1 again. Your settings and
-  folders are kept. macOS may ask once more to let Minamp control Spotify.
+  folders are kept. macOS may ask once more to let Minamp control Spotify. If the update needs
+  new Spotify permissions, a green **Reconnect Spotify** link appears in the library's bottom row;
+  click it and approve. (No link? Right-click the strip → **Disconnect Spotify Account**, then
+  **Connect** again. Your Client ID stays filled in.)
+- **Spotify's window stays put.** Picking a song plays it through Spotify Connect, so Spotify
+  doesn't jump to the front.
 - **Uninstall:** quit it, then delete `~/Applications/Minamp.app` and
   `~/Library/Application Support/Minamp`.
 
