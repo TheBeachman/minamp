@@ -135,12 +135,14 @@ final class SpotifyPlayer: ObservableObject {
             return true
         }
         guard let script = NSAppleScript(source: "tell application \"Spotify\" to \(command)") else { return false }
+        let before = Snapshot.take()
         var error: NSDictionary?
         script.executeAndReturnError(&error)
         if let error {
             lastError = error[NSAppleScript.errorMessage] as? String
             return false
         }
+        before?.restore()
         if refreshAfter {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 MainActor.assumeIsolated { self?.refresh() }
@@ -195,9 +197,42 @@ final class SpotifyPlayer: ObservableObject {
         let commands = queued
         queued = []
         for c in commands { run(c) }
-        // Spotify can show its window again once it finishes loading; tuck it away for a few seconds.
-        for delay in [0.5, 1.5, 3.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { app?.hide() }
+    }
+
+    /// Spotify opens and fronts its window whenever it's told to play, even when
+    /// its window was closed, minimized or hidden. Remember how things were before
+    /// a command and put them back for a couple of seconds afterwards.
+    private struct Snapshot {
+        let spotifyWasShowing: Bool
+        let frontmost: NSRunningApplication?
+
+        static func take() -> Snapshot? {
+            guard let sp = spotify else { return nil }
+            return Snapshot(spotifyWasShowing: !sp.isHidden && windowsOnScreen(sp) > 0,
+                            frontmost: NSWorkspace.shared.frontmostApplication)
+        }
+
+        func restore(attempt: Int = 0) {
+            guard !spotifyWasShowing, let sp = Self.spotify else { return }
+            // Hand focus back first: macOS won't hide the app that's in front.
+            if sp.isActive, let prev = frontmost, prev.bundleIdentifier != SpotifyPlayer.bundleID {
+                prev.activate()
+            }
+            if !sp.isHidden && Self.windowsOnScreen(sp) > 0 { sp.hide() }
+            guard attempt < 20 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { restore(attempt: attempt + 1) }
+        }
+
+        static var spotify: NSRunningApplication? {
+            NSRunningApplication.runningApplications(withBundleIdentifier: SpotifyPlayer.bundleID).first
+        }
+
+        static func windowsOnScreen(_ app: NSRunningApplication) -> Int {
+            let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+            return list.filter {
+                ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
+                    && ($0[kCGWindowLayer as String] as? Int) == 0
+            }.count
         }
     }
 
