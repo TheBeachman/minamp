@@ -343,6 +343,15 @@ struct TransportBar: View {
                     }
                     .font(.system(size: 11))
                     .padding(.leading, 4)
+                } else if api.connected && !api.canSeeContext {
+                    // The sign-in predates the now-playing permission: ask right where the name will go.
+                    Button(api.connecting ? "Approve in your browser…" : "Reconnect to show playlist") { api.connect() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(accent)
+                        .disabled(api.connecting)
+                        .padding(.leading, 4)
+                        .help("Spotify needs one more permission to say which playlist is playing")
                 }
                 Spacer(minLength: 4)
                 Image(systemName: vol < 1 ? "speaker.slash.fill" : "speaker.wave.2.fill")
@@ -411,7 +420,6 @@ struct LibraryView: View {
             ItemDetail(item: item)
         } else {
             VStack(spacing: 0) {
-                if !api.canSeeContext { ReconnectBanner() }
                 Picker("", selection: $ui.tab) {
                     ForEach(LibraryTab.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -571,24 +579,6 @@ struct FolderMenu: View {
         if let current {
             Button("Remove from \(current.name)") { folders.removeFromFolder(playlist.id) }
         }
-    }
-}
-
-struct ReconnectBanner: View {
-    @EnvironmentObject var api: SpotifyAPI
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(api.connecting ? "Approve in your browser…" : "Reconnect to show which playlist is playing.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 0)
-            Button("Reconnect") { api.connect() }
-                .controlSize(.mini)
-                .disabled(api.connecting)
-        }
-        .padding(.horizontal, 10)
-        .padding(.top, 8)
     }
 }
 
