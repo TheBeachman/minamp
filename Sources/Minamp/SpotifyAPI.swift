@@ -2,9 +2,9 @@ import AppKit
 import CryptoKit
 import Network
 
-/// A playlist or album row in the library.
-struct LibraryItem: Identifiable, Hashable {
-    enum Kind { case playlist, album }
+/// A playlist, album, artist or Liked Songs: anything Spotify can play as a context.
+struct LibraryItem: Identifiable, Hashable, Codable {
+    enum Kind: String, Codable { case playlist, album, artist, liked }
     let id: String
     let kind: Kind
     let name: String
@@ -43,7 +43,7 @@ enum APIError: LocalizedError {
 final class SpotifyAPI: ObservableObject {
     static let port: UInt16 = 8973
     static let redirectURI = "http://127.0.0.1:8973/callback"
-    static let scopes = "playlist-read-private playlist-read-collaborative user-library-read"
+    static let scopes = "playlist-read-private playlist-read-collaborative user-library-read user-read-currently-playing"
 
     @Published var clientID: String {
         didSet { UserDefaults.standard.set(clientID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "clientID") }
@@ -54,6 +54,10 @@ final class SpotifyAPI: ObservableObject {
     @Published private(set) var playlists: [LibraryItem] = []
     @Published private(set) var loadingPlaylists = false
     @Published private(set) var liked: [Track]?
+    /// The playlist/album/etc. the current song is playing from.
+    @Published private(set) var playingContext: LibraryItem?
+    /// False until the sign-in includes the now-playing permission (added after first release).
+    @Published private(set) var canSeeContext = false
     @Published var message: String?
 
     private var accessToken: String?
@@ -63,6 +67,10 @@ final class SpotifyAPI: ObservableObject {
 
     init() {
         clientID = UserDefaults.standard.string(forKey: "clientID") ?? ""
+        canSeeContext = Self.grantedScopes.contains("user-read-currently-playing")
+        if let cached = try? JSONDecoder().decode([LibraryItem].self, from: Data(contentsOf: AppSupport.url("playlists.json"))) {
+            playlists = cached  // instant list at launch; refreshed from Spotify below
+        }
         if TokenStore.read() != nil {
             connected = true
             Task { await bootstrap() }
@@ -133,12 +141,17 @@ final class SpotifyAPI: ObservableObject {
         userID = ""
         playlists = []
         liked = nil
+        playingContext = nil
+        canSeeContext = false
+        UserDefaults.standard.removeObject(forKey: "grantedScopes")
+        try? FileManager.default.removeItem(at: AppSupport.url("playlists.json"))
     }
 
     private func bootstrap() async {
         do {
             userID = try await get("/me")["id"] as? String ?? ""
             await loadPlaylists()
+            await refreshContext()
         } catch {
             handle(error)
         }
@@ -158,6 +171,10 @@ final class SpotifyAPI: ObservableObject {
         accessToken = token
         expiry = Date().addingTimeInterval((json["expires_in"] as? Double ?? 3600) - 60)
         if let refresh = json["refresh_token"] as? String { TokenStore.save(refresh) }
+        if let scope = json["scope"] as? String {
+            UserDefaults.standard.set(scope, forKey: "grantedScopes")
+            canSeeContext = scope.contains("user-read-currently-playing")
+        }
     }
 
     private func validToken() async throws -> String {
@@ -197,6 +214,7 @@ final class SpotifyAPI: ObservableObject {
                 try await Task.sleep(for: .seconds(min(wait, 10)))
                 continue
             }
+            if code == 204 { return [:] }  // e.g. nothing playing
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             guard (200..<300).contains(code), let json else {
                 let msg = (json?["error"] as? [String: Any])?["message"] as? String ?? "request failed"
@@ -219,6 +237,7 @@ final class SpotifyAPI: ObservableObject {
                 next = page["next"] as? String
             }
             playlists = out
+            if let data = try? JSONEncoder().encode(out) { try? data.write(to: AppSupport.url("playlists.json")) }
         } catch {
             handle(error)
         }
@@ -255,6 +274,60 @@ final class SpotifyAPI: ObservableObject {
             handle(error)
         }
     }
+
+    func albumTracks(_ album: LibraryItem) async throws -> [Track] {
+        var out: [Track] = []
+        var next: String? = "/albums/\(album.id)/tracks?limit=50"
+        while let n = next, out.count < 500 {
+            let page = try await get(n)
+            for j in page["items"] as? [[String: Any]] ?? [] {
+                // Album tracks come without album art; use the album's.
+                if let t = Self.track(j, row: out.count) {
+                    out.append(Track(id: t.id, uri: t.uri, name: t.name, artists: t.artists,
+                                     imageURL: album.imageURL, durationMs: t.durationMs))
+                }
+            }
+            next = page["next"] as? String
+        }
+        return out
+    }
+
+    /// Ask Spotify what the current song is playing from. Called when the track changes.
+    func refreshContext() async {
+        guard connected, canSeeContext else { return }
+        do {
+            let j = try await get("/me/player/currently-playing")
+            guard let ctx = j["context"] as? [String: Any], let uri = ctx["uri"] as? String,
+                  let type = ctx["type"] as? String else {
+                playingContext = nil
+                return
+            }
+            if playingContext?.uri == uri { return }
+            let id = String(uri.split(separator: ":").last ?? "")
+            switch type {
+            case "playlist":
+                if let known = playlists.first(where: { $0.uri == uri }) {
+                    playingContext = known
+                } else {
+                    playingContext = Self.playlist(try await get("/playlists/\(id)?fields=id,name,uri,owner(display_name),images"))
+                }
+            case "album":
+                playingContext = ((j["item"] as? [String: Any])?["album"] as? [String: Any]).flatMap(Self.album)
+            case "collection":
+                playingContext = LibraryItem(id: "liked", kind: .liked, name: "Liked Songs", uri: uri, subtitle: "", imageURL: nil)
+            case "artist":
+                let a = try await get("/artists/\(id)")
+                playingContext = LibraryItem(id: id, kind: .artist, name: a["name"] as? String ?? "Artist", uri: uri,
+                                             subtitle: "Artist", imageURL: Self.smallImage(a["images"]))
+            default:
+                playingContext = nil
+            }
+        } catch {
+            // Not worth surfacing; the label just stays as it was.
+        }
+    }
+
+    private static var grantedScopes: String { UserDefaults.standard.string(forKey: "grantedScopes") ?? "" }
 
     var likedContext: String? { userID.isEmpty ? nil : "spotify:user:\(userID):collection" }
 
@@ -425,15 +498,9 @@ final class LoopbackServer: @unchecked Sendable {
 /// ad-hoc signed app gets a new identity on every rebuild, and the keychain
 /// then blocks launch with a password prompt.
 enum TokenStore {
-    private static var url: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Minamp/spotify-refresh-token")
-    }
+    private static var url: URL { AppSupport.url("spotify-refresh-token") }
 
     static func save(_ value: String) {
-        let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
         FileManager.default.createFile(atPath: url.path, contents: Data(value.utf8),
                                        attributes: [.posixPermissions: 0o600])
     }
@@ -444,5 +511,16 @@ enum TokenStore {
 
     static func delete() {
         try? FileManager.default.removeItem(at: url)
+    }
+}
+
+/// ~/Library/Application Support/Minamp, created on first use and private to you.
+enum AppSupport {
+    static func url(_ name: String) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Minamp")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        return dir.appendingPathComponent(name)
     }
 }

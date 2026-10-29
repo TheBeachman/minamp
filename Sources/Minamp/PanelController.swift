@@ -129,6 +129,11 @@ final class PanelController {
         })
     }
 
+    /// Give the library keyboard focus (e.g. to type a folder name).
+    func focusLibrary() {
+        libraryPanel.makeKey()
+    }
+
     // MARK: Layout
 
     private var visibleFrame: NSRect {

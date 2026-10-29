@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// Borderless floating panel. Non-activating, so clicking it never pulls focus
@@ -20,6 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let player = SpotifyPlayer()
     let api = SpotifyAPI()
     let ui = UIState()
+    let folders = FolderStore()
+    private var watchers: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = Self.editMenu()
@@ -30,6 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let libraryPanel = makePanel(frame: strip, root: LibraryCard())
         controller = PanelController(strip: stripPanel, library: libraryPanel, ui: ui, frame: strip)
         stripPanel.orderFrontRegardless()
+
+        // When the song changes, ask Spotify what it's playing from.
+        player.$trackURI
+            .removeDuplicates()
+            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+            .sink { [api] _ in Task { await api.refreshContext() } }
+            .store(in: &watchers)
 
         // `open Minamp.app --args --expanded` starts open and pinned (handy for screenshots).
         if CommandLine.arguments.contains("--expanded") {
@@ -55,7 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .environment(\.colorScheme, .dark)
             .environmentObject(player)
             .environmentObject(api)
-            .environmentObject(ui))
+            .environmentObject(ui)
+            .environmentObject(folders))
         host.sizingOptions = []  // the window decides the size, not SwiftUI
         panel.contentView = host
         return panel

@@ -21,6 +21,17 @@ final class UIState: ObservableObject {
     @Published var openItem: LibraryItem?
     @Published var query = ""
     weak var controller: PanelController?
+
+    /// Show a playlist/album in the library, opening the library if needed.
+    func open(_ item: LibraryItem) {
+        if item.kind == .liked {
+            tab = .liked
+            openItem = nil
+        } else {
+            openItem = item
+        }
+        controller?.expand()
+    }
 }
 
 // MARK: - Shared
@@ -151,6 +162,7 @@ struct GripLines: Shape {
 
 struct StripView: View {
     @EnvironmentObject var player: SpotifyPlayer
+    @EnvironmentObject var api: SpotifyAPI
     @EnvironmentObject var ui: UIState
 
     var body: some View {
@@ -176,9 +188,16 @@ struct StripView: View {
                             Text(headline)
                                 .font(.system(size: max(10, min(14, h * 0.27)), weight: .semibold))
                             if h >= 34 && !player.artist.isEmpty {
-                                Text(player.artist)
-                                    .font(.system(size: max(9, min(12, h * 0.22))))
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 4) {
+                                    Text(player.artist)
+                                        .foregroundStyle(.secondary)
+                                        .layoutPriority(1)
+                                    if let ctx = api.playingContext {
+                                        Text("·").foregroundStyle(.tertiary)
+                                        ContextLink(item: ctx)
+                                    }
+                                }
+                                .font(.system(size: max(9, min(12, h * 0.22))))
                             }
                         }
                         .lineLimit(1)
@@ -289,6 +308,7 @@ struct LibraryCard: View {
 /// Seek, shuffle, repeat and volume. Play/pause/skip live on the strip.
 struct TransportBar: View {
     @EnvironmentObject var player: SpotifyPlayer
+    @EnvironmentObject var api: SpotifyAPI
     @State private var scrub: Double?
     @State private var vol: Double = 50
     @State private var editingVol = false
@@ -314,6 +334,15 @@ struct TransportBar: View {
             HStack(spacing: 10) {
                 IconButton(symbol: "shuffle", active: player.shuffling, help: "Shuffle") { player.toggleShuffle() }
                 IconButton(symbol: "repeat", active: player.repeating, help: "Repeat") { player.toggleRepeat() }
+                if let ctx = api.playingContext {
+                    HStack(spacing: 4) {
+                        Image(systemName: ctx.kind == .album ? "opticaldisc" : "music.note.list")
+                            .foregroundStyle(.secondary)
+                        ContextLink(item: ctx)
+                    }
+                    .font(.system(size: 11))
+                    .padding(.leading, 4)
+                }
                 Spacer(minLength: 4)
                 Image(systemName: vol < 1 ? "speaker.slash.fill" : "speaker.wave.2.fill")
                     .font(.system(size: 10))
@@ -327,6 +356,25 @@ struct TransportBar: View {
             .onChange(of: vol) { _, v in if editingVol { player.setVolume(v) } }
             .onChange(of: player.volume) { _, v in if !editingVol { vol = v } }
         }
+    }
+}
+
+/// The name of what's playing (playlist, album…); click to show it in the library.
+struct ContextLink: View {
+    let item: LibraryItem
+    @EnvironmentObject var ui: UIState
+    @State private var hover = false
+
+    var body: some View {
+        Button { ui.open(item) } label: {
+            Text(item.name)
+                .lineLimit(1)
+                .foregroundStyle(accent)
+                .underline(hover)
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help("Playing from \(item.name)")
     }
 }
 
@@ -362,6 +410,7 @@ struct LibraryView: View {
             ItemDetail(item: item)
         } else {
             VStack(spacing: 0) {
+                if !api.canSeeContext { ReconnectBanner() }
                 Picker("", selection: $ui.tab) {
                     ForEach(LibraryTab.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -383,15 +432,35 @@ struct PlaylistsTab: View {
     @EnvironmentObject var api: SpotifyAPI
     @EnvironmentObject var ui: UIState
     @EnvironmentObject var player: SpotifyPlayer
+    @EnvironmentObject var folders: FolderStore
     @State private var filter = ""
+
+    private enum Row: Identifiable {
+        case folder(LibraryFolder, count: Int)
+        case playlist(LibraryItem, inFolder: Bool)
+        var id: String {
+            switch self {
+            case .folder(let f, _): return "folder-\(f.id)"
+            case .playlist(let p, _): return p.id
+            }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             FieldBox(prompt: "Filter playlists", text: $filter)
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(filtered) { p in
-                        ItemRow(item: p, open: { ui.openItem = p }, play: { player.play(p.uri) })
+                    ForEach(rows) { row in
+                        switch row {
+                        case .folder(let f, let count):
+                            FolderRow(folder: f, count: count)
+                        case .playlist(let p, let inFolder):
+                            ItemRow(item: p, playing: p.uri == api.playingContext?.uri,
+                                    open: { ui.openItem = p }, play: { player.play(p.uri) })
+                                .padding(.leading, inFolder ? 16 : 0)
+                                .contextMenu { FolderMenu(playlist: p) }
+                        }
                     }
                 }
                 .padding(.vertical, 4)
@@ -403,9 +472,122 @@ struct PlaylistsTab: View {
         }
     }
 
-    private var filtered: [LibraryItem] {
+    /// Spotify's order, with each folder shown where its first playlist would be.
+    /// While filtering, folders are ignored and every match is listed.
+    private var rows: [Row] {
         let f = filter.trimmingCharacters(in: .whitespaces)
-        return f.isEmpty ? api.playlists : api.playlists.filter { $0.name.localizedCaseInsensitiveContains(f) }
+        if !f.isEmpty {
+            return api.playlists.filter { $0.name.localizedCaseInsensitiveContains(f) }.map { .playlist($0, inFolder: false) }
+        }
+        var out: [Row] = []
+        var shown = Set<UUID>()
+        for p in api.playlists {
+            guard let folder = folders.folder(containing: p.id) else {
+                out.append(.playlist(p, inFolder: false))
+                continue
+            }
+            if shown.contains(folder.id) { continue }
+            shown.insert(folder.id)
+            let members = api.playlists.filter { folder.playlistIDs.contains($0.id) }
+            out.append(.folder(folder, count: members.count))
+            if !folder.collapsed { out += members.map { .playlist($0, inFolder: true) } }
+        }
+        return out
+    }
+}
+
+struct FolderRow: View {
+    let folder: LibraryFolder
+    let count: Int
+    @EnvironmentObject var folders: FolderStore
+    @EnvironmentObject var ui: UIState
+    @State private var hover = false
+    @State private var name = ""
+    @FocusState private var editing: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 3).fill(Color.white.opacity(0.06))
+                Image(systemName: "folder.fill").font(.system(size: 14)).foregroundStyle(.secondary)
+            }
+            .frame(width: 34, height: 34)
+            if folders.renaming == folder.id {
+                TextField("Folder name", text: $name)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .focused($editing)
+                    .onChange(of: name) { _, v in folders.rename(folder.id, to: v) }
+                    .onSubmit { folders.renaming = nil }
+                    .onChange(of: editing) { _, now in if !now { folders.renaming = nil } }
+                    .onAppear {
+                        name = folder.name
+                        ui.controller?.focusLibrary()
+                        editing = true
+                    }
+            } else {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(folder.name).font(.system(size: 12, weight: .medium))
+                    Text("\(count) playlists").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .rotationEffect(.degrees(folder.collapsed ? 0 : 90))
+                .frame(width: 24)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(hover ? Color.white.opacity(0.08) : .clear)
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { folders.toggle(folder.id) } }
+        .contextMenu {
+            Button("Rename") { folders.renaming = folder.id }
+            Button("Delete Folder") { folders.delete(folder.id) }
+        }
+    }
+}
+
+/// Right-click menu on a playlist: file it in a folder.
+struct FolderMenu: View {
+    let playlist: LibraryItem
+    @EnvironmentObject var folders: FolderStore
+
+    var body: some View {
+        let current = folders.folder(containing: playlist.id)
+        Menu("Move to Folder") {
+            ForEach(folders.folders) { f in
+                Button(f.name) { folders.move(playlist.id, to: f.id) }
+                    .disabled(f.id == current?.id)
+            }
+            if !folders.folders.isEmpty { Divider() }
+            Button("New Folder…") { folders.newFolder(with: playlist.id) }
+        }
+        if let current {
+            Button("Remove from \(current.name)") { folders.removeFromFolder(playlist.id) }
+        }
+    }
+}
+
+struct ReconnectBanner: View {
+    @EnvironmentObject var api: SpotifyAPI
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(api.connecting ? "Approve in your browser…" : "Reconnect to show which playlist is playing.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            Button("Reconnect") { api.connect() }
+                .controlSize(.mini)
+                .disabled(api.connecting)
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
     }
 }
 
@@ -502,12 +684,12 @@ struct ItemDetail: View {
             }
         }
         .task(id: item.id) {
-            guard item.kind == .playlist else {
-                error = "Press play to start this album."
-                return
-            }
             do {
-                tracks = try await api.playlistTracks(item)
+                switch item.kind {
+                case .playlist: tracks = try await api.playlistTracks(item)
+                case .album: tracks = try await api.albumTracks(item)
+                case .artist, .liked: error = "Press play to start it."
+                }
             } catch APIError.http(let code, _) where code == 403 || code == 404 {
                 error = "Spotify only lists the songs in playlists you own. Press play to start it."
             } catch {
@@ -542,6 +724,7 @@ struct TrackList: View {
 
 struct ItemRow: View {
     let item: LibraryItem
+    var playing = false
     let open: () -> Void
     let play: () -> Void
     @State private var hover = false
@@ -552,7 +735,9 @@ struct ItemRow: View {
                 .frame(width: 34, height: 34)
                 .clipShape(RoundedRectangle(cornerRadius: 3))
             VStack(alignment: .leading, spacing: 1) {
-                Text(item.name).font(.system(size: 12, weight: .medium))
+                Text(item.name)
+                    .font(.system(size: 12, weight: playing ? .semibold : .medium))
+                    .foregroundStyle(playing ? accent : .primary)
                 if !item.subtitle.isEmpty {
                     Text(item.subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
