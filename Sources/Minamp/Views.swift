@@ -12,95 +12,185 @@ enum LibraryTab: String, CaseIterable, Identifiable {
 @MainActor
 final class UIState: ObservableObject {
     @Published var expanded = false
+    @Published var showLibrary = false
+    @Published var hovering = false
     @Published var pinned = false
+    /// Where the two cards sit inside the window (top-left origin). Set by PanelController.
+    @Published var stripRect = CGRect.zero
+    @Published var libraryRect: CGRect?
+    @Published var libraryAbove = true
+    @Published var libraryAlignRight = false
     @Published var tab: LibraryTab = .playlists
     @Published var openItem: LibraryItem?
     @Published var query = ""
-    var expandNow: () -> Void = {}
+    weak var controller: PanelController?
 }
 
 // MARK: - Root
 
 struct RootView: View {
     @EnvironmentObject var ui: UIState
-    @EnvironmentObject var api: SpotifyAPI
 
     var body: some View {
-        ZStack {
-            VisualEffect()
-            if ui.expanded { ExpandedView() } else { CompactView() }
+        ZStack(alignment: .topLeading) {
+            Color.clear
+            if ui.showLibrary, let r = ui.libraryRect {
+                LibraryCard()
+                    .frame(width: r.width, height: r.height)
+                    .offset(x: r.minX, y: r.minY)
+                    .transition(.opacity.combined(with: .offset(y: ui.libraryAbove ? 10 : -10)))
+            }
+            StripView()
+                .frame(width: ui.stripRect.width, height: ui.stripRect.height)
+                .offset(x: ui.stripRect.minX, y: ui.stripRect.minY)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .environment(\.colorScheme, .dark)
-        .contextMenu {
-            Toggle("Keep Expanded", isOn: $ui.pinned)
-            Divider()
-            Button("Open Spotify") {
-                if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: SpotifyPlayer.bundleID) {
-                    NSWorkspace.shared.openApplication(at: url, configuration: .init())
-                }
-            }
-            if api.connected {
-                Button("Reload Playlists") { Task { await api.loadPlaylists() } }
-                Button("Disconnect Spotify Account") { api.disconnect() }
-            }
-            if api.connected || !api.clientID.isEmpty {
-                Button("Reset Spotify Setup…") { api.disconnect(forgetClientID: true) }
-            }
-            Toggle("Open at Login", isOn: Binding(
-                get: { SMAppService.mainApp.status == .enabled },
-                set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
-            ))
-            Divider()
-            Button("Quit Minamp") { NSApp.terminate(nil) }
-        }
     }
 }
 
-struct VisualEffect: NSViewRepresentable {
+struct AppMenu: View {
+    @EnvironmentObject var ui: UIState
+    @EnvironmentObject var api: SpotifyAPI
+
+    var body: some View {
+        Toggle("Keep Expanded", isOn: $ui.pinned)
+        Divider()
+        Button("Open Spotify") {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: SpotifyPlayer.bundleID) {
+                NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            }
+        }
+        if api.connected {
+            Button("Reload Playlists") { Task { await api.loadPlaylists() } }
+            Button("Disconnect Spotify Account") { api.disconnect() }
+        }
+        if api.connected || !api.clientID.isEmpty {
+            Button("Reset Spotify Setup…") { api.disconnect(forgetClientID: true) }
+        }
+        Toggle("Open at Login", isOn: Binding(
+            get: { SMAppService.mainApp.status == .enabled },
+            set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
+        ))
+        Divider()
+        Button("Quit Minamp") { NSApp.terminate(nil) }
+    }
+}
+
+/// Blurred dark card background with rounded corners.
+struct CardBackground: NSViewRepresentable {
+    static let radius: CGFloat = 9
+
     func makeNSView(context: Context) -> NSVisualEffectView {
         let v = NSVisualEffectView()
         v.material = .hudWindow
         v.blendingMode = .behindWindow
         v.state = .active
+        let r = Self.radius
+        let mask = NSImage(size: NSSize(width: r * 2 + 1, height: r * 2 + 1), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r).fill()
+            return true
+        }
+        mask.capInsets = NSEdgeInsets(top: r, left: r, bottom: r, right: r)
+        mask.resizingMode = .stretch
+        v.maskImage = mask
         return v
     }
+
     func updateNSView(_ v: NSVisualEffectView, context: Context) {}
 }
 
-/// Drag the window from any non-control area. Uses screen coordinates so the
-/// window moving under the cursor doesn't feed back into the drag.
+/// Drag the player from any non-control area.
 struct WindowDrag: ViewModifier {
-    @State private var start: (mouse: NSPoint, origin: NSPoint)?
+    @EnvironmentObject var ui: UIState
+    @State private var dragging = false
 
     func body(content: Content) -> some View {
         content.gesture(
             DragGesture(minimumDistance: 2)
-                .onChanged { _ in
-                    guard let w = NSApp.windows.first(where: { $0 is PlayerPanel }) else { return }
-                    let m = NSEvent.mouseLocation
-                    if start == nil { start = (m, w.frame.origin) }
-                    guard let s = start else { return }
-                    w.setFrameOrigin(NSPoint(x: s.origin.x + m.x - s.mouse.x, y: s.origin.y + m.y - s.mouse.y))
+                .onChanged { value in
+                    if !dragging {
+                        dragging = true
+                        ui.controller?.beginMove(translation: value.translation)
+                    }
+                    ui.controller?.move()
                 }
-                .onEnded { _ in start = nil }
+                .onEnded { _ in
+                    dragging = false
+                    ui.controller?.endMove()
+                }
         )
     }
 }
 
-// MARK: - Compact
+/// Classic three-line resize grip. Drag it to resize that card.
+struct ResizeGrip: View {
+    let handle: PanelController.Handle
+    var flipX = false
+    var flipY = false
+    @EnvironmentObject var ui: UIState
+    @State private var dragging = false
 
-struct CompactView: View {
+    var body: some View {
+        GripLines()
+            .stroke(Color.white.opacity(dragging ? 0.9 : ui.hovering ? 0.6 : 0.3),
+                    style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
+            .frame(width: 9, height: 9)
+            .scaleEffect(x: flipX ? -1 : 1, y: flipY ? -1 : 1)
+            .padding(4)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        if !dragging {
+                            dragging = true
+                            ui.controller?.beginResize()
+                        }
+                        ui.controller?.resize(handle)
+                    }
+                    .onEnded { _ in
+                        dragging = false
+                        ui.controller?.endResize()
+                    }
+            )
+            .help("Drag to resize")
+    }
+}
+
+/// Three diagonal strokes in the bottom-right corner of the rect.
+struct GripLines: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        for i in 1...3 {
+            let t = r.width * CGFloat(i) / 3
+            p.move(to: CGPoint(x: r.maxX - t, y: r.maxY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY - t))
+        }
+        return p
+    }
+}
+
+// MARK: - Strip
+
+struct StripView: View {
     @EnvironmentObject var player: SpotifyPlayer
+    @EnvironmentObject var ui: UIState
 
     var body: some View {
         GeometryReader { g in
             let w = g.size.width, h = g.size.height
             let pad = min(6, h * 0.12)
+            let active = ui.hovering || ui.expanded
             ZStack(alignment: .bottom) {
                 if w < h * 1.7 {
-                    // Too narrow for text: just the album art.
+                    // Too narrow for text: album art, with play/pause on hover.
                     RemoteImage(url: player.artURL).frame(width: w, height: h)
+                    if active {
+                        Color.black.opacity(0.4)
+                        StripButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: min(w, h) * 0.38) { player.playPause() }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 } else {
                     HStack(spacing: 8) {
                         RemoteImage(url: player.artURL)
@@ -117,24 +207,56 @@ struct CompactView: View {
                         }
                         .lineLimit(1)
                         Spacer(minLength: 0)
-                        if player.running && !player.isPlaying && !player.title.isEmpty {
+                        if active {
+                            let s = max(9, min(15, h * 0.3))
+                            HStack(spacing: max(2, s * 0.35)) {
+                                StripButton(symbol: "backward.fill", size: s) { player.previous() }
+                                StripButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: s * 1.2) { player.playPause() }
+                                StripButton(symbol: "forward.fill", size: s) { player.next() }
+                            }
+                            .transition(.opacity)
+                        } else if player.running && !player.isPlaying && !player.title.isEmpty {
                             Image(systemName: "pause.fill").font(.system(size: 9)).foregroundStyle(.secondary)
                         }
                     }
-                    .padding(.horizontal, pad)
+                    .padding(.leading, pad)
+                    .padding(.trailing, active ? 12 : pad)
                     .frame(width: w, height: h)
+                    .animation(.easeOut(duration: 0.12), value: active)
                 }
                 ProgressLine().frame(height: 2)
             }
+            .frame(width: w, height: h)
         }
+        .background(CardBackground())
+        .clipShape(RoundedRectangle(cornerRadius: CardBackground.radius))
         .contentShape(Rectangle())
         .modifier(WindowDrag())
+        .overlay(alignment: .bottomTrailing) { ResizeGrip(handle: .strip) }
+        .contextMenu { AppMenu() }
         .help(player.title.isEmpty ? "Minamp" : "\(player.title) — \(player.artist)")
     }
 
     private var headline: String {
         if !player.title.isEmpty { return player.title }
         return player.running ? "Nothing playing" : "Spotify isn't open"
+    }
+}
+
+struct StripButton: View {
+    let symbol: String
+    let size: CGFloat
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: size, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+                .frame(width: size * 1.7, height: size * 1.9)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -151,42 +273,52 @@ struct ProgressLine: View {
     }
 }
 
-// MARK: - Expanded
+// MARK: - Library card
 
-struct ExpandedView: View {
+struct LibraryCard: View {
+    @EnvironmentObject var ui: UIState
+
     var body: some View {
         VStack(spacing: 0) {
-            NowPlaying().padding(10)
-            Divider().opacity(0.5)
-            LibraryView()
+            // The transport row always sits on the edge nearest the strip.
+            if ui.libraryAbove {
+                LibraryView()
+                Divider().opacity(0.5)
+                TransportBar().padding(.horizontal, 10).padding(.vertical, 7)
+            } else {
+                TransportBar().padding(.horizontal, 10).padding(.vertical, 7)
+                Divider().opacity(0.5)
+                LibraryView()
+            }
+        }
+        .background(CardBackground())
+        .clipShape(RoundedRectangle(cornerRadius: CardBackground.radius))
+        .overlay(alignment: gripAlignment) {
+            ResizeGrip(handle: .library, flipX: ui.libraryAlignRight, flipY: ui.libraryAbove)
+        }
+        .contextMenu { AppMenu() }
+    }
+
+    /// The corner farthest from the strip.
+    private var gripAlignment: Alignment {
+        switch (ui.libraryAbove, ui.libraryAlignRight) {
+        case (true, true): return .topLeading
+        case (true, false): return .topTrailing
+        case (false, true): return .bottomLeading
+        case (false, false): return .bottomTrailing
         }
     }
 }
 
-struct NowPlaying: View {
+/// Seek, shuffle, repeat and volume. Play/pause/skip live on the strip.
+struct TransportBar: View {
     @EnvironmentObject var player: SpotifyPlayer
     @State private var scrub: Double?
     @State private var vol: Double = 50
     @State private var editingVol = false
 
     var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                RemoteImage(url: player.artURL)
-                    .frame(width: 56, height: 56)
-                    .clipShape(RoundedRectangle(cornerRadius: 5))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(player.title.isEmpty ? (player.running ? "Nothing playing" : "Spotify isn't open") : player.title)
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(player.artist).font(.system(size: 12)).foregroundStyle(.secondary)
-                    Text(player.album).font(.system(size: 11)).foregroundStyle(.tertiary)
-                }
-                .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .contentShape(Rectangle())
-            .modifier(WindowDrag())
-
+        VStack(spacing: 4) {
             TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
                 let pos = scrub ?? player.position(at: ctx.date)
                 HStack(spacing: 6) {
@@ -203,17 +335,8 @@ struct NowPlaying: View {
                 .font(.system(size: 10).monospacedDigit())
                 .foregroundStyle(.secondary)
             }
-
-            HStack(spacing: 14) {
+            HStack(spacing: 10) {
                 IconButton(symbol: "shuffle", active: player.shuffling, help: "Shuffle") { player.toggleShuffle() }
-                IconButton(symbol: "backward.fill", help: "Previous") { player.previous() }
-                Button { player.playPause() } label: {
-                    Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.white)
-                }
-                .buttonStyle(.plain)
-                IconButton(symbol: "forward.fill", help: "Next") { player.next() }
                 IconButton(symbol: "repeat", active: player.repeating, help: "Repeat") { player.toggleRepeat() }
                 Spacer(minLength: 4)
                 Image(systemName: vol < 1 ? "speaker.slash.fill" : "speaker.wave.2.fill")
@@ -222,7 +345,7 @@ struct NowPlaying: View {
                 Slider(value: $vol, in: 0...100, onEditingChanged: { editingVol = $0 })
                     .controlSize(.mini)
                     .tint(.white)
-                    .frame(maxWidth: 90)
+                    .frame(maxWidth: 110)
             }
             .onAppear { vol = player.volume }
             .onChange(of: vol) { _, v in if editingVol { player.setVolume(v) } }
@@ -575,7 +698,7 @@ struct ConnectView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Connect Spotify to browse playlists")
                     .font(.system(size: 13, weight: .semibold))
-                Text("The controls above already work. Browsing needs a Spotify developer app. It's a one-time, two-minute setup.")
+                Text("Play controls already work. Browsing needs a Spotify developer app. It's a one-time, two-minute setup.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
 

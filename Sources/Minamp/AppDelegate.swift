@@ -9,18 +9,24 @@ final class PlayerPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Lets the first click on an inactive panel hit the button under it.
+final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: PlayerPanel!
-    private var hover: HoverController!
+    private var controller: PanelController!
     let player = SpotifyPlayer()
     let api = SpotifyAPI()
     let ui = UIState()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = Self.editMenu()
-        panel = PlayerPanel(contentRect: Self.startFrame(),
-                            styleMask: [.borderless, .resizable, .nonactivatingPanel],
+        let strip = Self.startFrame()
+        panel = PlayerPanel(contentRect: strip,
+                            styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.level = .floating
         panel.isFloatingPanel = true
@@ -29,26 +35,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-        panel.minSize = NSSize(width: 32, height: 24)
 
         let root = RootView()
             .environmentObject(player)
             .environmentObject(api)
             .environmentObject(ui)
-        let host = NSHostingView(rootView: root)
+        let host = FirstMouseHostingView(rootView: root)
         host.sizingOptions = []  // the window decides the size, not SwiftUI
-        host.wantsLayer = true
-        host.layer?.cornerRadius = 9
-        host.layer?.masksToBounds = true
         panel.contentView = host
-        panel.orderFrontRegardless()
 
-        hover = HoverController(panel: panel, ui: ui)
+        controller = PanelController(panel: panel, ui: ui, strip: strip)
+        panel.orderFrontRegardless()
 
         // `open Minamp.app --args --expanded` starts open and pinned (handy for screenshots).
         if CommandLine.arguments.contains("--expanded") {
             ui.pinned = true
-            ui.expandNow()
+            controller.expand()
         }
     }
 
@@ -72,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return main
     }
 
-    /// Last compact frame, if it is still on a connected screen; otherwise bottom-right of the main screen.
+    /// Last strip frame, if it is still on a connected screen; otherwise bottom-right of the main screen.
     private static func startFrame() -> NSRect {
         if let saved = Prefs.compactFrame,
            NSScreen.screens.contains(where: { $0.visibleFrame.intersects(saved) }) {
@@ -91,8 +93,8 @@ enum Prefs {
         set { defaults.set(newValue.map(NSStringFromRect), forKey: "compactFrame") }
     }
 
-    static var expandedSize: NSSize {
-        get { defaults.string(forKey: "expandedSize").map(NSSizeFromString) ?? NSSize(width: 360, height: 540) }
-        set { defaults.set(NSStringFromSize(newValue), forKey: "expandedSize") }
+    static var librarySize: NSSize {
+        get { defaults.string(forKey: "librarySize").map(NSSizeFromString) ?? NSSize(width: 340, height: 440) }
+        set { defaults.set(NSStringFromSize(newValue), forKey: "librarySize") }
     }
 }

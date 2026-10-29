@@ -1,7 +1,6 @@
 import AppKit
 import CryptoKit
 import Network
-import Security
 
 /// A playlist or album row in the library.
 struct LibraryItem: Identifiable, Hashable {
@@ -39,7 +38,7 @@ enum APIError: LocalizedError {
 
 /// Spotify Web API, used only to *browse* (playlists, liked songs, search).
 /// Sign-in is Authorization Code + PKCE against a loopback redirect, so no
-/// client secret is stored. The refresh token lives in the login keychain.
+/// client secret is stored. The refresh token lives in TokenStore.
 @MainActor
 final class SpotifyAPI: ObservableObject {
     static let port: UInt16 = 8973
@@ -64,7 +63,7 @@ final class SpotifyAPI: ObservableObject {
 
     init() {
         clientID = UserDefaults.standard.string(forKey: "clientID") ?? ""
-        if Keychain.read() != nil {
+        if TokenStore.read() != nil {
             connected = true
             Task { await bootstrap() }
         }
@@ -128,7 +127,7 @@ final class SpotifyAPI: ObservableObject {
     /// Forget the sign-in. `forgetClientID` also clears the developer app, to start setup over.
     func disconnect(forgetClientID: Bool = false) {
         if forgetClientID { clientID = "" }
-        Keychain.delete()
+        TokenStore.delete()
         accessToken = nil
         connected = false
         userID = ""
@@ -158,13 +157,13 @@ final class SpotifyAPI: ObservableObject {
         }
         accessToken = token
         expiry = Date().addingTimeInterval((json["expires_in"] as? Double ?? 3600) - 60)
-        if let refresh = json["refresh_token"] as? String { Keychain.save(refresh) }
+        if let refresh = json["refresh_token"] as? String { TokenStore.save(refresh) }
     }
 
     private func validToken() async throws -> String {
         if let t = accessToken, Date() < expiry { return t }
         if refreshing == nil {
-            guard let refresh = Keychain.read() else { throw APIError.notConnected }
+            guard let refresh = TokenStore.read() else { throw APIError.notConnected }
             refreshing = Task {
                 try await tokenRequest(["grant_type": "refresh_token", "refresh_token": refresh, "client_id": trimmedClientID])
             }
@@ -419,32 +418,31 @@ final class LoopbackServer: @unchecked Sendable {
     }
 }
 
-// MARK: - Keychain
+// MARK: - Token file
 
-enum Keychain {
-    private static let base: [CFString: Any] = [
-        kSecClass: kSecClassGenericPassword,
-        kSecAttrService: "ca.beachman.minamp",
-        kSecAttrAccount: "spotify-refresh-token",
-    ]
+/// The Spotify refresh token, in a file only you can read
+/// (~/Library/Application Support/Minamp, mode 0600). Not the keychain: an
+/// ad-hoc signed app gets a new identity on every rebuild, and the keychain
+/// then blocks launch with a password prompt.
+enum TokenStore {
+    private static var url: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Minamp/spotify-refresh-token")
+    }
 
     static func save(_ value: String) {
-        delete()
-        var q = base
-        q[kSecValueData] = Data(value.utf8)
-        SecItemAdd(q as CFDictionary, nil)
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        FileManager.default.createFile(atPath: url.path, contents: Data(value.utf8),
+                                       attributes: [.posixPermissions: 0o600])
     }
 
     static func read() -> String? {
-        var q = base
-        q[kSecReturnData] = true
-        q[kSecMatchLimit] = kSecMatchLimitOne
-        var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
+        (try? String(contentsOf: url, encoding: .utf8)).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     static func delete() {
-        SecItemDelete(base as CFDictionary)
+        try? FileManager.default.removeItem(at: url)
     }
 }
