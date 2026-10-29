@@ -16,7 +16,6 @@ final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var panel: PlayerPanel!
     private var controller: PanelController!
     let player = SpotifyPlayer()
     let api = SpotifyAPI()
@@ -25,9 +24,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = Self.editMenu()
         let strip = Self.startFrame()
-        panel = PlayerPanel(contentRect: strip,
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
+        // Two windows, each with its own shadow: the strip, and the library card
+        // that appears beside it. The strip window never resizes to make room.
+        let stripPanel = makePanel(frame: strip, root: StripView())
+        let libraryPanel = makePanel(frame: strip, root: LibraryCard())
+        controller = PanelController(strip: stripPanel, library: libraryPanel, ui: ui, frame: strip)
+        stripPanel.orderFrontRegardless()
+
+        // `open Minamp.app --args --expanded` starts open and pinned (handy for screenshots).
+        if CommandLine.arguments.contains("--expanded") {
+            ui.pinned = true
+            controller.expand()
+        }
+    }
+
+    private func makePanel<V: View>(frame: NSRect, root: V) -> PlayerPanel {
+        let panel = PlayerPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                                backing: .buffered, defer: false)
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
@@ -35,23 +48,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-
-        let root = RootView()
+        // Only take keyboard focus when a text field is clicked, never just by appearing.
+        panel.becomesKeyOnlyIfNeeded = true
+        let host = FirstMouseHostingView(rootView: root
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environment(\.colorScheme, .dark)
             .environmentObject(player)
             .environmentObject(api)
-            .environmentObject(ui)
-        let host = FirstMouseHostingView(rootView: root)
+            .environmentObject(ui))
         host.sizingOptions = []  // the window decides the size, not SwiftUI
         panel.contentView = host
-
-        controller = PanelController(panel: panel, ui: ui, strip: strip)
-        panel.orderFrontRegardless()
-
-        // `open Minamp.app --args --expanded` starts open and pinned (handy for screenshots).
-        if CommandLine.arguments.contains("--expanded") {
-            ui.pinned = true
-            controller.expand()
-        }
+        return panel
     }
 
     /// Menu-bar-less apps still route ⌘C/⌘V/⌘A through the main menu; without
@@ -77,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Last strip frame, if it is still on a connected screen; otherwise bottom-right of the main screen.
     private static func startFrame() -> NSRect {
         if let saved = Prefs.compactFrame,
-           NSScreen.screens.contains(where: { $0.visibleFrame.intersects(saved) }) {
+           NSScreen.screens.contains(where: { $0.frame.intersects(saved) }) {
             return saved
         }
         let vf = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)

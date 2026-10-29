@@ -1,13 +1,14 @@
 import AppKit
 import SwiftUI
 
-/// Owns the window geometry. The strip never moves when the library opens:
-/// the window grows to cover the strip plus a library card stacked above it
-/// (or below, when the strip sits in the top half of the screen), and the
-/// card fades in. Moving and resizing go through here too.
+/// Owns both windows. The strip window never moves or resizes when the
+/// library opens; the library is its own window (a child of the strip, so
+/// they move together) stacked above the strip, or below when the strip sits
+/// in the top half of the screen. Separate windows mean each gets a correct
+/// shadow; one shared window left a stale shadow showing through the card.
 ///
 /// Polls the mouse instead of using tracking areas, which fire spurious
-/// enter/exit events whenever the window's frame changes.
+/// enter/exit events whenever a window's frame changes.
 @MainActor
 final class PanelController {
     enum Handle { case strip, library }
@@ -15,26 +16,29 @@ final class PanelController {
     static let expandDelay: TimeInterval = 0.5
     static let collapseDelay: TimeInterval = 0.45
     static let gap: CGFloat = 6
+    static let slide: CGFloat = 8
     static let minStrip = NSSize(width: 32, height: 24)
     static let minLibrary = NSSize(width: 260, height: 180)
 
-    private let panel: NSPanel
+    private let stripPanel: NSPanel
+    private let libraryPanel: NSPanel
     private let ui: UIState
     private var timer: Timer?
     private var strip: NSRect          // screen coordinates
-    private var library: NSRect?       // screen coordinates, while expanded
+    private var library = NSRect.zero  // screen coordinates; only on screen while expanded
     private var insideSince: Date?
     private var outsideSince: Date?
     private var pressStrip: NSRect?
     private var waitForExit = false
-    private var collapsing = false
+    private var animating = false
     private var moveStart: (mouse: NSPoint, origin: NSPoint)?
     private var resizeStart: (mouse: NSPoint, strip: NSRect, library: NSSize)?
 
-    init(panel: NSPanel, ui: UIState, strip: NSRect) {
-        self.panel = panel
+    init(strip stripPanel: NSPanel, library libraryPanel: NSPanel, ui: UIState, frame: NSRect) {
+        self.stripPanel = stripPanel
+        self.libraryPanel = libraryPanel
         self.ui = ui
-        self.strip = strip
+        self.strip = frame
         ui.controller = self
         applyLayout()
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -45,19 +49,19 @@ final class PanelController {
     // MARK: Hover
 
     private var hotRects: [NSRect] {
-        guard let lib = library else { return [strip] }
+        guard ui.expanded else { return [strip] }
         // Include the gap between the cards so crossing it doesn't collapse.
-        let x0 = max(strip.minX, lib.minX), x1 = min(strip.maxX, lib.maxX)
-        let band = NSRect(x: x0, y: min(strip.maxY, lib.maxY), width: max(0, x1 - x0),
-                          height: abs(lib.midY - strip.midY))
-        return [strip, lib, band]
+        let x0 = max(strip.minX, library.minX), x1 = min(strip.maxX, library.maxX)
+        let band = NSRect(x: x0, y: min(strip.maxY, library.maxY), width: max(0, x1 - x0),
+                          height: abs(library.midY - strip.midY))
+        return [strip, library, band]
     }
 
     private func tick() {
         let mouse = NSEvent.mouseLocation
         let inside = hotRects.contains { $0.insetBy(dx: -1, dy: -1).contains(mouse) }
         if ui.hovering != inside { ui.hovering = inside }
-        guard !collapsing else { return }
+        guard !animating else { return }
         let now = Date()
 
         if NSEvent.pressedMouseButtons != 0 {
@@ -89,38 +93,51 @@ final class PanelController {
         insideSince = nil
         ui.expanded = true
         applyLayout()
-        // Fade the card in on the next turn, once the window has finished growing.
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.ui.expanded else { return }
-            withAnimation(.easeOut(duration: 0.18)) { self.ui.showLibrary = true }
-        }
+        // Start slightly tucked toward the strip and transparent, then settle into place.
+        libraryPanel.setFrame(library.offsetBy(dx: 0, dy: ui.libraryAbove ? -Self.slide : Self.slide), display: true)
+        libraryPanel.alphaValue = 0
+        stripPanel.addChildWindow(libraryPanel, ordered: .above)
+        libraryPanel.orderFront(nil)
+        libraryPanel.makeFirstResponder(nil)
+        animating = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            libraryPanel.animator().alphaValue = 1
+            libraryPanel.animator().setFrame(library, display: true)
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated { self?.animating = false }
+        })
     }
 
     private func collapse() {
         outsideSince = nil
-        collapsing = true
-        panel.makeFirstResponder(nil)
-        withAnimation(.easeIn(duration: 0.12)) {
-            ui.showLibrary = false
-        } completion: { [weak self] in
-            guard let self else { return }
-            self.collapsing = false
-            self.ui.expanded = false
-            self.applyLayout()
-        }
+        libraryPanel.makeFirstResponder(nil)
+        animating = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            libraryPanel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.stripPanel.removeChildWindow(self.libraryPanel)
+                self.libraryPanel.orderOut(nil)
+                self.ui.expanded = false
+                self.animating = false
+            }
+        })
     }
 
     // MARK: Layout
 
     private var visibleFrame: NSRect {
         let center = NSPoint(x: strip.midX, y: strip.midY)
-        let screen = NSScreen.screens.first { $0.frame.contains(center) } ?? panel.screen ?? NSScreen.main
+        let screen = NSScreen.screens.first { $0.frame.contains(center) } ?? stripPanel.screen ?? NSScreen.main
         return screen?.visibleFrame ?? strip
     }
 
-    /// Where the library card goes, computed even while collapsed so the
-    /// views are already laid out for it when the window grows.
-    private func libraryFrame() -> (frame: NSRect, above: Bool, alignRight: Bool) {
+    private func applyLayout() {
         let vf = visibleFrame
         let above = strip.midY < vf.midY
         let alignRight = strip.midX > vf.midX
@@ -131,31 +148,20 @@ final class PanelController {
         var x = alignRight ? strip.maxX - w : strip.minX
         x = min(max(x, vf.minX), vf.maxX - w)
         let y = above ? strip.maxY + Self.gap : strip.minY - Self.gap - h
-        return (NSRect(x: x, y: y, width: w, height: h), above, alignRight)
-    }
+        library = NSRect(x: x, y: y, width: w, height: h)
+        if ui.libraryAbove != above { ui.libraryAbove = above }
+        if ui.libraryAlignRight != alignRight { ui.libraryAlignRight = alignRight }
 
-    private func applyLayout() {
-        let lib = libraryFrame()
-        library = ui.expanded ? lib.frame : nil
-        let frame = library.map { strip.union($0) } ?? strip
-
-        // The views pin the strip to the window edge on the strip's side, so a
-        // resize can never draw it anywhere else. Offsets are only non-zero when
-        // the card had to be nudged to stay on screen.
-        let stripOffset = lib.alignRight ? strip.maxX - frame.maxX : strip.minX - frame.minX
-        let libOffset = lib.alignRight ? lib.frame.maxX - strip.maxX : lib.frame.minX - strip.minX
-        func set<T: Equatable>(_ key: ReferenceWritableKeyPath<UIState, T>, _ value: T) {
-            if ui[keyPath: key] != value { ui[keyPath: key] = value }
+        if stripPanel.frame != strip {
+            let resized = stripPanel.frame.size != strip.size
+            stripPanel.setFrame(strip, display: true)
+            if resized { stripPanel.invalidateShadow() }
         }
-        panel.disableScreenUpdatesUntilFlush()
-        set(\.libraryAbove, lib.above)
-        set(\.libraryAlignRight, lib.alignRight)
-        set(\.stripSize, strip.size)
-        set(\.stripOffsetX, stripOffset)
-        set(\.librarySize, lib.frame.size)
-        set(\.libraryOffsetX, libOffset)
-        panel.setFrame(frame, display: true)
-        panel.invalidateShadow()
+        if ui.expanded && libraryPanel.frame != library {
+            let resized = libraryPanel.frame.size != library.size
+            libraryPanel.setFrame(library, display: true)
+            if resized { libraryPanel.invalidateShadow() }
+        }
     }
 
     // MARK: Move and resize (called from the views' drag gestures)
@@ -179,7 +185,7 @@ final class PanelController {
     }
 
     func beginResize() {
-        resizeStart = (NSEvent.mouseLocation, strip, library?.size ?? Prefs.librarySize)
+        resizeStart = (NSEvent.mouseLocation, strip, ui.expanded ? library.size : Prefs.librarySize)
     }
 
     func resize(_ handle: Handle) {
@@ -204,6 +210,6 @@ final class PanelController {
     func endResize() {
         resizeStart = nil
         Prefs.compactFrame = strip
-        if let library { Prefs.librarySize = library.size }
+        if ui.expanded { Prefs.librarySize = library.size }
     }
 }

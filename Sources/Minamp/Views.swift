@@ -12,15 +12,9 @@ enum LibraryTab: String, CaseIterable, Identifiable {
 @MainActor
 final class UIState: ObservableObject {
     @Published var expanded = false
-    @Published var showLibrary = false
     @Published var hovering = false
     @Published var pinned = false
-    /// Card geometry, set by PanelController. The strip is pinned to the window
-    /// edge on its side; the library card hangs off the strip.
-    @Published var stripSize = CGSize(width: 280, height: 52)
-    @Published var stripOffsetX: CGFloat = 0
-    @Published var librarySize = CGSize(width: 340, height: 440)
-    @Published var libraryOffsetX: CGFloat = 0
+    /// Which side of the strip the library card sits on. Set by PanelController.
     @Published var libraryAbove = true
     @Published var libraryAlignRight = false
     @Published var tab: LibraryTab = .playlists
@@ -29,34 +23,7 @@ final class UIState: ObservableObject {
     weak var controller: PanelController?
 }
 
-// MARK: - Root
-
-struct RootView: View {
-    @EnvironmentObject var ui: UIState
-
-    var body: some View {
-        let h: HorizontalAlignment = ui.libraryAlignRight ? .trailing : .leading
-        ZStack(alignment: Alignment(horizontal: h, vertical: ui.libraryAbove ? .bottom : .top)) {
-            Color.clear
-            StripView()
-                .frame(width: ui.stripSize.width, height: ui.stripSize.height)
-                .overlay(alignment: Alignment(horizontal: h, vertical: ui.libraryAbove ? .top : .bottom)) {
-                    // Always mounted (keeps scroll position and avoids building it
-                    // mid-animation); hidden and outside the window while collapsed.
-                    LibraryCard()
-                        .frame(width: ui.librarySize.width, height: ui.librarySize.height)
-                        .alignmentGuide(.top) { d in d[.bottom] + PanelController.gap }
-                        .alignmentGuide(.bottom) { d in d[.top] - PanelController.gap }
-                        .offset(x: ui.libraryOffsetX, y: ui.showLibrary ? 0 : (ui.libraryAbove ? 10 : -10))
-                        .opacity(ui.showLibrary ? 1 : 0)
-                        .allowsHitTesting(ui.showLibrary)
-                }
-                .offset(x: ui.stripOffsetX)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .environment(\.colorScheme, .dark)
-    }
-}
+// MARK: - Shared
 
 struct AppMenu: View {
     @EnvironmentObject var ui: UIState
