@@ -89,7 +89,11 @@ final class PanelController {
         insideSince = nil
         ui.expanded = true
         applyLayout()
-        withAnimation(.easeOut(duration: 0.16)) { ui.showLibrary = true }
+        // Fade the card in on the next turn, once the window has finished growing.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.ui.expanded else { return }
+            withAnimation(.easeOut(duration: 0.18)) { self.ui.showLibrary = true }
+        }
     }
 
     private func collapse() {
@@ -114,8 +118,9 @@ final class PanelController {
         return screen?.visibleFrame ?? strip
     }
 
-    private func layoutLibrary() -> NSRect? {
-        guard ui.expanded else { return nil }
+    /// Where the library card goes, computed even while collapsed so the
+    /// views are already laid out for it when the window grows.
+    private func libraryFrame() -> (frame: NSRect, above: Bool, alignRight: Bool) {
         let vf = visibleFrame
         let above = strip.midY < vf.midY
         let alignRight = strip.midX > vf.midX
@@ -126,20 +131,29 @@ final class PanelController {
         var x = alignRight ? strip.maxX - w : strip.minX
         x = min(max(x, vf.minX), vf.maxX - w)
         let y = above ? strip.maxY + Self.gap : strip.minY - Self.gap - h
-        if ui.libraryAbove != above { ui.libraryAbove = above }
-        if ui.libraryAlignRight != alignRight { ui.libraryAlignRight = alignRight }
-        return NSRect(x: x, y: y, width: w, height: h)
+        return (NSRect(x: x, y: y, width: w, height: h), above, alignRight)
     }
 
     private func applyLayout() {
-        library = layoutLibrary()
+        let lib = libraryFrame()
+        library = ui.expanded ? lib.frame : nil
         let frame = library.map { strip.union($0) } ?? strip
-        func local(_ r: NSRect) -> CGRect {
-            CGRect(x: r.minX - frame.minX, y: frame.maxY - r.maxY, width: r.width, height: r.height)
+
+        // The views pin the strip to the window edge on the strip's side, so a
+        // resize can never draw it anywhere else. Offsets are only non-zero when
+        // the card had to be nudged to stay on screen.
+        let stripOffset = lib.alignRight ? strip.maxX - frame.maxX : strip.minX - frame.minX
+        let libOffset = lib.alignRight ? lib.frame.maxX - strip.maxX : lib.frame.minX - strip.minX
+        func set<T: Equatable>(_ key: ReferenceWritableKeyPath<UIState, T>, _ value: T) {
+            if ui[keyPath: key] != value { ui[keyPath: key] = value }
         }
         panel.disableScreenUpdatesUntilFlush()
-        ui.stripRect = local(strip)
-        ui.libraryRect = library.map(local)
+        set(\.libraryAbove, lib.above)
+        set(\.libraryAlignRight, lib.alignRight)
+        set(\.stripSize, strip.size)
+        set(\.stripOffsetX, stripOffset)
+        set(\.librarySize, lib.frame.size)
+        set(\.libraryOffsetX, libOffset)
         panel.setFrame(frame, display: true)
         panel.invalidateShadow()
     }
