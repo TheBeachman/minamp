@@ -129,6 +129,11 @@ final class SpotifyPlayer: ObservableObject {
 
     @discardableResult
     private func run(_ command: String, refreshAfter: Bool = true) -> Bool {
+        // Talking to Spotify while it's quit would launch it with its window up.
+        guard Self.spotifyIsRunning else {
+            launchHidden(then: command)
+            return true
+        }
         guard let script = NSAppleScript(source: "tell application \"Spotify\" to \(command)") else { return false }
         var error: NSDictionary?
         script.executeAndReturnError(&error)
@@ -142,6 +147,58 @@ final class SpotifyPlayer: ObservableObject {
             }
         }
         return true
+    }
+
+    // MARK: Starting Spotify in the background
+
+    private var queued: [String] = []
+    private var launching = false
+
+    /// Start Spotify hidden, then send the queued commands once it answers.
+    private func launchHidden(then command: String) {
+        queued.append(command)
+        guard !launching else { return }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleID) else {
+            queued = []
+            lastError = "Spotify isn't installed."
+            return
+        }
+        launching = true
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = false
+        config.hides = true
+        config.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { [weak self] app, _ in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.waitUntilReady(app, attempt: 0) }
+            }
+        }
+    }
+
+    private func waitUntilReady(_ app: NSRunningApplication?, attempt: Int) {
+        app?.hide()
+        var error: NSDictionary?
+        NSAppleScript(source: """
+            tell application "Spotify"
+                with timeout of 2 seconds
+                    get player state
+                end timeout
+            end tell
+            """)?.executeAndReturnError(&error)
+        if error != nil && attempt < 40 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                MainActor.assumeIsolated { self?.waitUntilReady(app, attempt: attempt + 1) }
+            }
+            return
+        }
+        launching = false
+        let commands = queued
+        queued = []
+        for c in commands { run(c) }
+        // Spotify can show its window again once it finishes loading; tuck it away for a few seconds.
+        for delay in [0.5, 1.5, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { app?.hide() }
+        }
     }
 
     /// URIs come from the Web API; strip anything that could break out of the AppleScript string.
