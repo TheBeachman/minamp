@@ -63,7 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // Every desktop, but not over full-screen apps (videos, presentations).
+        panel.collectionBehavior = [.canJoinAllSpaces]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
