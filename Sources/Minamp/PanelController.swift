@@ -49,19 +49,25 @@ final class PanelController {
 
     // MARK: Hover
 
-    private var hotRects: [NSRect] {
-        guard ui.expanded else { return [strip] }
-        // Include the gap between the cards so crossing it doesn't collapse.
+    /// Is the mouse on Minamp? Being inside the frame isn't enough: the Dock and
+    /// other always-on-top windows can cover part of the strip, and hovering
+    /// those (say, to click a Dock icon) mustn't open the library.
+    private func mouseIsOnPlayer(_ mouse: NSPoint) -> Bool {
+        let topmost = NSWindow.windowNumber(at: mouse, belowWindowWithWindowNumber: 0)
+        if strip.insetBy(dx: -1, dy: -1).contains(mouse) && topmost == stripPanel.windowNumber { return true }
+        guard ui.expanded else { return false }
+        if library.insetBy(dx: -1, dy: -1).contains(mouse) && topmost == libraryPanel.windowNumber { return true }
+        // The gap between the cards, so crossing it doesn't collapse.
         let x0 = max(strip.minX, library.minX), x1 = min(strip.maxX, library.maxX)
-        let band = NSRect(x: x0, y: min(strip.maxY, library.maxY), width: max(0, x1 - x0),
-                          height: abs(library.midY - strip.midY))
-        return [strip, library, band]
+        let gap = NSRect(x: x0, y: min(strip.maxY, library.maxY), width: max(0, x1 - x0),
+                         height: max(0, max(strip.minY, library.minY) - min(strip.maxY, library.maxY)))
+        return gap.insetBy(dx: 0, dy: -1).contains(mouse)
     }
 
     private func tick() {
         guard !isHidden else { return }
         let mouse = NSEvent.mouseLocation
-        let inside = hotRects.contains { $0.insetBy(dx: -1, dy: -1).contains(mouse) }
+        let inside = mouseIsOnPlayer(mouse)
         if ui.hovering != inside { ui.hovering = inside }
         guard !animating else { return }
         let now = Date()
