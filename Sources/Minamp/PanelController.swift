@@ -32,6 +32,9 @@ final class PanelController {
     private var waitForExit = false
     private var animating = false
     private(set) var isHidden = false
+    /// Stepped aside because a full-screen app (a video, a presentation) covers the strip's screen.
+    private var coveredByFullScreen = false
+    private var fullScreenTimer: Timer?
     private var moveStart: (mouse: NSPoint, origin: NSPoint)?
     private var resizeStart: (mouse: NSPoint, strip: NSRect, library: NSSize)?
 
@@ -44,6 +47,9 @@ final class PanelController {
         applyLayout()
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
+        }
+        fullScreenTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkFullScreen() }
         }
     }
 
@@ -65,7 +71,7 @@ final class PanelController {
     }
 
     private func tick() {
-        guard !isHidden else { return }
+        guard !isHidden && !coveredByFullScreen else { return }
         let mouse = NSEvent.mouseLocation
         let inside = mouseIsOnPlayer(mouse)
         if ui.hovering != inside { ui.hovering = inside }
@@ -142,16 +148,59 @@ final class PanelController {
         guard hide != isHidden else { return }
         isHidden = hide
         if hide {
-            if ui.expanded {
-                stripPanel.removeChildWindow(libraryPanel)
-                libraryPanel.orderOut(nil)
-                ui.expanded = false
-            }
-            ui.hovering = false
-            stripPanel.orderOut(nil)
-        } else {
+            putAway()
+        } else if !coveredByFullScreen {
             insideSince = nil
             stripPanel.orderFrontRegardless()
+        }
+    }
+
+    private func putAway() {
+        if ui.expanded {
+            stripPanel.removeChildWindow(libraryPanel)
+            libraryPanel.orderOut(nil)
+            ui.expanded = false
+        }
+        ui.hovering = false
+        stripPanel.orderOut(nil)
+    }
+
+    // MARK: Full screen
+
+    /// A menu-bar-only app's panels float over full-screen spaces whatever their
+    /// collection behaviour says, so watch for a full-screen window and step aside.
+    private func checkFullScreen() {
+        let covered = fullScreenWindowCoversStrip()
+        guard covered != coveredByFullScreen else { return }
+        coveredByFullScreen = covered
+        if covered {
+            putAway()
+        } else if !isHidden {
+            insideSince = nil
+            stripPanel.orderFrontRegardless()
+        }
+    }
+
+    /// True when another app has an on-screen window filling the strip's whole
+    /// screen, menu bar area included. Ordinary windows, even maximised ones,
+    /// start below the menu bar.
+    private func fullScreenWindowCoversStrip() -> Bool {
+        let center = NSPoint(x: strip.midX, y: strip.midY)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(center) }),
+              let mainHeight = NSScreen.screens.first?.frame.height else { return false }
+        let f = screen.frame
+        // Window bounds come in top-left-origin coordinates.
+        let target = CGRect(x: f.minX, y: mainHeight - f.maxY, width: f.width, height: f.height)
+        let me = ProcessInfo.processInfo.processIdentifier
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        return windows.contains { w in
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  (w[kCGWindowOwnerPID as String] as? pid_t) != me,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = b["X"], let y = b["Y"], let width = b["Width"], let height = b["Height"] else { return false }
+            return abs(x - target.minX) < 2 && abs(y - target.minY) < 2
+                && abs(width - target.width) < 2 && abs(height - target.height) < 2
         }
     }
 
